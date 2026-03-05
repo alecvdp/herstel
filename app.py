@@ -3,6 +3,7 @@ import pandas as pd
 import uuid
 import json
 import os
+import re
 from datetime import date, datetime, time
 from pathlib import Path
 
@@ -101,6 +102,127 @@ def df_for_display(df: pd.DataFrame, sobriety_date: date) -> pd.DataFrame:
 
 def df_to_markdown(df: pd.DataFrame) -> str:
     return df.to_markdown(index=False)
+
+
+def normalize_date(val: str) -> str:
+    """Convert various date formats to YYYY-MM-DD."""
+    val = val.strip()
+    for fmt in ("%Y/%m/%d", "%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(val, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return ""
+
+
+def normalize_time(val: str) -> str:
+    """Convert various time formats to HH:MM (24-hour)."""
+    val = val.strip()
+    # Already 24-hour like "19:00"
+    m = re.match(r"^(\d{1,2}:\d{2})\s*$", val)
+    if m:
+        return m.group(1).zfill(5)
+    # 12-hour with AM/PM like "7:00 PM"
+    m = re.match(r"^(\d{1,2}:\d{2})\s*(AM|PM)$", val, re.IGNORECASE)
+    if m:
+        try:
+            return datetime.strptime(f"{m.group(1)} {m.group(2).upper()}", "%I:%M %p").strftime("%H:%M")
+        except ValueError:
+            pass
+    # Embedded 24-hour time with extra text like "18:00 (Euro time)"
+    m = re.match(r"^(\d{1,2}:\d{2})", val)
+    if m:
+        return m.group(1).zfill(5)
+    return ""
+
+
+def infer_fellowship(meeting_name: str) -> str:
+    """Guess fellowship from meeting name keywords."""
+    name = meeting_name.lower()
+    if "recovery dharma" in name or name.startswith("rd:") or name.startswith("rd ") or "non dukkha" in name or "non dhukka" in name or "cling free rd" in name or "northstar rd" in name or "hollow bones zen" in name:
+        return "Recovery Dharma"
+    if "pir:" in name or "pir " in name or "psychedelics in recovery" in name:
+        return "Psychedelics in Recovery"
+    if "lifering" in name:
+        return "LifeRing"
+    if "aca:" in name or "aca " in name:
+        return "ACA"
+    if "secular" in name or "agnostic" in name or "freethinker" in name or "humanist" in name or "without a prayer" in name or "omagod" in name or "satanic" in name:
+        return "Secular AA"
+    return "AA"
+
+
+def parse_import_csv(uploaded_file) -> tuple[pd.DataFrame | None, list[str]]:
+    """Parse an uploaded CSV and return (mapped_df, warnings)."""
+    warnings = []
+    try:
+        raw = pd.read_csv(uploaded_file, dtype=str).fillna("")
+    except Exception as e:
+        return None, [f"Failed to read CSV: {e}"]
+
+    # Clean column names
+    raw.columns = [c.strip() for c in raw.columns]
+
+    # Map columns by common names
+    col_map = {}
+    for col in raw.columns:
+        cl = col.lower().strip()
+        if cl in ("date",):
+            col_map["date"] = col
+        elif cl in ("meeting name", "meeting", "name"):
+            col_map["meeting"] = col
+        elif cl in ("time",):
+            col_map["time"] = col
+        elif cl in ("location", "place", "venue"):
+            col_map["location"] = col
+        elif cl in ("notes", "note", "comments"):
+            col_map["notes"] = col
+        elif cl in ("fellowship", "program", "type"):
+            col_map["fellowship"] = col
+
+    if "date" not in col_map:
+        return None, ["Could not find a 'Date' column in the CSV."]
+    if "meeting" not in col_map:
+        return None, ["Could not find a 'Meeting Name' or 'Meeting' column in the CSV."]
+
+    rows = []
+    for i, row in raw.iterrows():
+        # Clean embedded newlines from all fields
+        cleaned = {k: str(row[v]).replace("\n", "").strip() if v else "" for k, v in col_map.items()}
+
+        d = normalize_date(cleaned.get("date", ""))
+        if not d:
+            warnings.append(f"Row {i + 2}: Could not parse date '{cleaned.get('date', '')}'")
+            continue
+
+        t = normalize_time(cleaned.get("time", ""))
+        if not t:
+            warnings.append(f"Row {i + 2}: Could not parse time '{cleaned.get('time', '')}', using 00:00")
+            t = "00:00"
+
+        meeting = cleaned.get("meeting", "").strip()
+        if not meeting:
+            warnings.append(f"Row {i + 2}: Empty meeting name, skipping")
+            continue
+
+        fellowship = cleaned.get("fellowship", "").strip()
+        if not fellowship:
+            fellowship = infer_fellowship(meeting)
+
+        rows.append({
+            "id": generate_id(),
+            "date": d,
+            "time": t,
+            "meeting": meeting,
+            "fellowship": fellowship,
+            "location": cleaned.get("location", ""),
+            "notes": cleaned.get("notes", ""),
+        })
+
+    if not rows:
+        return None, warnings + ["No valid rows found in CSV."]
+
+    return pd.DataFrame(rows, columns=LOG_COLUMNS), warnings
 
 
 # ── Page config ──────────────────────────────────────────────────────────────
@@ -238,8 +360,8 @@ def render_meeting_log():
             display_df,
             use_container_width=True,
             num_rows="fixed",
-            hide_columns=["id"],
-            disabled=["day", "id"],
+            column_order=["date", "day", "time", "meeting", "fellowship", "location", "notes"],
+            disabled=["day"],
             column_config={
                 "date": st.column_config.TextColumn("Date"),
                 "day": st.column_config.NumberColumn("Day #", help="Day of recovery"),
@@ -457,6 +579,55 @@ def render_settings():
                 st.rerun()
             elif new_f.strip() in config["fellowships"]:
                 st.warning("That fellowship already exists.")
+
+    # Import CSV
+    st.subheader("Import CSV")
+    st.caption("Import meetings from an existing CSV file. The importer will try to map columns automatically.")
+
+    uploaded = st.file_uploader("Choose a CSV file", type="csv", key="csv_import")
+    if uploaded is not None:
+        import_df, import_warnings = parse_import_csv(uploaded)
+
+        if import_warnings:
+            with st.expander(f"{len(import_warnings)} warning(s)"):
+                for w in import_warnings:
+                    st.warning(w)
+
+        if import_df is not None:
+            st.caption(f"Found {len(import_df)} meetings to import")
+            preview = df_for_display(import_df, sobriety_date).drop(columns=["id"])
+            st.dataframe(preview, use_container_width=True, hide_index=True)
+
+            # Check for new fellowships
+            existing_fellowships = set(config["fellowships"])
+            imported_fellowships = set(import_df["fellowship"].unique())
+            new_fellowships = imported_fellowships - existing_fellowships
+            if new_fellowships:
+                st.info(f"New fellowships found: {', '.join(sorted(new_fellowships))}. They will be added to your fellowship list.")
+
+            ic1, ic2 = st.columns(2)
+            with ic1:
+                if st.button("Import (append to existing data)"):
+                    df = st.session_state.log_df
+                    merged = pd.concat([df, import_df], ignore_index=True)
+                    save_log(merged)
+                    if new_fellowships:
+                        config["fellowships"].extend(sorted(new_fellowships))
+                        save_config(config)
+                        st.session_state.config = config
+                    refresh_log()
+                    st.toast(f"Imported {len(import_df)} meetings!")
+                    st.rerun()
+            with ic2:
+                if st.button("Import (replace all data)"):
+                    save_log(import_df)
+                    if new_fellowships:
+                        config["fellowships"].extend(sorted(new_fellowships))
+                        save_config(config)
+                        st.session_state.config = config
+                    refresh_log()
+                    st.toast(f"Replaced data with {len(import_df)} imported meetings!")
+                    st.rerun()
 
     # Data management
     st.subheader("Data Management")
